@@ -21,6 +21,7 @@
 #   SEMGREP_TOKEN    : Semgrep API token (required)
 #   DEPLOYMENT_SLUG  : deploymentSlug (string used in URL path, required)
 #   JIRA_PROJECT_ID  : JIRA project ID (required; always included in payload)
+#   PROJECT_PREFIX   : Repository name prefix filter, e.g. "myorg/" (required)
 # Optional:
 #   SEMGREP_BASE_URL : default https://semgrep.dev
 
@@ -51,9 +52,9 @@ logger = logging.getLogger(__name__)
 SEMGREP_BASE_URL = os.getenv("SEMGREP_BASE_URL", "https://semgrep.dev").rstrip("/")
 DEPLOYMENT_SLUG = os.getenv("DEPLOYMENT_SLUG", "").strip()
 
-PROJECT_PREFIX = "sebasrevuelta/"  # only projects starting with this prefix
+PROJECT_PREFIX = os.getenv("PROJECT_PREFIX", "").strip()  # only projects starting with this prefix
 
-# JIRA project ID (required; always included in the ticket payload)
+# JIRA project ID (optional; included only when provided)
 JIRA_PROJECT_ID = os.getenv("JIRA_PROJECT_ID", "").strip()
 
 # Findings query behavior
@@ -63,6 +64,8 @@ FINDINGS_STATUS = "open"  # commonly "open" / "fixed" / etc. (adjust to your wor
 # Misc
 REQUEST_TIMEOUT_S = 30
 RATE_LIMIT_SLEEP_S = 2   # naive backoff on 429/5xx
+MAX_RETRIES = 5
+MAX_BACKOFF_S = 30
 
 
 # =========================
@@ -84,25 +87,65 @@ class SemgrepClient:
     def _request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, json: Any = None) -> Dict[str, Any]:
         url = urljoin(self.base_url + "/", path.lstrip("/"))
 
-        while True:
-            resp = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json,
-                timeout=self.timeout_s,
-            )
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json,
+                    timeout=self.timeout_s,
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if attempt == MAX_RETRIES:
+                    raise RuntimeError(
+                        f"{method} {url} failed after {MAX_RETRIES} attempts due to a network timeout/connection error: {exc}"
+                    ) from exc
+                sleep_s = min(MAX_BACKOFF_S, RATE_LIMIT_SLEEP_S * attempt)
+                logger.warning(
+                    "%s %s network error on attempt %d/%d: %s. Retrying in %ss.",
+                    method,
+                    url,
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
 
             # Basic backoff for rate limiting / transient errors
             if resp.status_code in (429, 500, 502, 503, 504):
-                time.sleep(RATE_LIMIT_SLEEP_S)
+                if attempt == MAX_RETRIES:
+                    raise RuntimeError(
+                        f"{method} {url} failed after {MAX_RETRIES} attempts with retryable HTTP status {resp.status_code}\n{resp.text}"
+                    )
+                sleep_s = min(MAX_BACKOFF_S, RATE_LIMIT_SLEEP_S * attempt)
+                logger.warning(
+                    "%s %s returned %d on attempt %d/%d. Retrying in %ss.",
+                    method,
+                    url,
+                    resp.status_code,
+                    attempt,
+                    MAX_RETRIES,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
                 continue
 
             if not resp.ok:
                 raise RuntimeError(
                     f"{method} {url} failed: {resp.status_code}\n{resp.text}"
                 )
-            return resp.json()
+
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"{method} {url} returned a non-JSON response: {resp.text}"
+                ) from exc
+
+        raise RuntimeError(f"{method} {url} failed after retries.")
 
     def list_projects(self, deployment_slug: str) -> List[Dict[str, Any]]:
         path = f"/api/v1/deployments/{deployment_slug}/projects"
@@ -225,20 +268,123 @@ def build_ticket_payload(
     *,
     issue_type: str,
     issue_id: int,
-    jira_project_id: str,
+    jira_project_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Mandatory fields: issue_type, issue_ids, and jira_project_id.
+    Mandatory fields: issue_type and issue_ids.
+    Optional field: jira_project_id.
     """
-    return {
+    payload: Dict[str, Any] = {
         "issue_type": issue_type,
         "issue_ids": [issue_id],
-        "jira_project_id": jira_project_id,
     }
+    if jira_project_id:
+        payload["jira_project_id"] = jira_project_id
+    return payload
+
+
+def _bucket_contains_issue_id(bucket: Any, issue_id: int) -> bool:
+    if isinstance(bucket, list):
+        for item in bucket:
+            if isinstance(item, int) and item == issue_id:
+                return True
+            if isinstance(item, str) and item.isdigit() and int(item) == issue_id:
+                return True
+            if isinstance(item, dict):
+                nested_ids = item.get("issue_ids")
+                if isinstance(nested_ids, list):
+                    for nested_id in nested_ids:
+                        if isinstance(nested_id, int) and nested_id == issue_id:
+                            return True
+                        if isinstance(nested_id, str) and nested_id.isdigit() and int(nested_id) == issue_id:
+                            return True
+                for key in ("issue_id", "id"):
+                    value = item.get(key)
+                    if isinstance(value, int) and value == issue_id:
+                        return True
+                    if isinstance(value, str) and value.isdigit() and int(value) == issue_id:
+                        return True
+    return False
+
+
+def get_ticket_creation_status(resp: Dict[str, Any], issue_id: int) -> str:
+    """
+    Classify Semgrep ticket creation response for a specific issue_id.
+    """
+    if _bucket_contains_issue_id(resp.get("succeeded"), issue_id):
+        return "success"
+    if _bucket_contains_issue_id(resp.get("skipped"), issue_id):
+        return "skipped"
+    if _bucket_contains_issue_id(resp.get("failed"), issue_id):
+        return "failure"
+
+    # Fallback when issue IDs are not echoed by API response.
+    if isinstance(resp.get("failed"), list) and resp.get("failed"):
+        return "failure"
+    if isinstance(resp.get("succeeded"), list) and resp.get("succeeded"):
+        return "success"
+    if isinstance(resp.get("skipped"), list) and resp.get("skipped"):
+        return "skipped"
+    return "unknown"
+
+
+def get_ticket_creation_failure_reason(resp: Dict[str, Any], issue_id: int) -> Optional[str]:
+    """
+    Extract a human-readable failure reason from the "failed" response bucket.
+    """
+    failed_bucket = resp.get("failed")
+    if not isinstance(failed_bucket, list):
+        return None
+
+    matched_item: Optional[Dict[str, Any]] = None
+    for item in failed_bucket:
+        if not isinstance(item, dict):
+            continue
+        if _bucket_contains_issue_id([item], issue_id):
+            matched_item = item
+            break
+
+    # Fall back to first failed entry if we cannot match by issue_id.
+    if matched_item is None:
+        for item in failed_bucket:
+            if isinstance(item, dict):
+                matched_item = item
+                break
+
+    if matched_item is None:
+        return None
+
+    for key in ("message", "error", "reason", "detail", "details"):
+        value = matched_item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    nested_error = matched_item.get("errors")
+    if isinstance(nested_error, list):
+        texts: List[str] = []
+        for entry in nested_error:
+            if isinstance(entry, str) and entry.strip():
+                texts.append(entry.strip())
+            elif isinstance(entry, dict):
+                for key in ("message", "error", "reason", "detail"):
+                    value = entry.get(key)
+                    if isinstance(value, str) and value.strip():
+                        texts.append(value.strip())
+                        break
+        if texts:
+            return "; ".join(texts)
+
+    return None
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create JIRA tickets from Semgrep findings.")
+    parser.add_argument(
+        "--deployment",
+        metavar="SLUG",
+        default=None,
+        help="Semgrep deployment slug. Overrides the DEPLOYMENT_SLUG env var.",
+    )
     parser.add_argument(
         "--repo",
         metavar="REPO",
@@ -284,12 +430,14 @@ def main() -> int:
     if not token:
         logger.error("SEMGREP_TOKEN env var is required.")
         return 2
-    if not DEPLOYMENT_SLUG:
-        logger.error("DEPLOYMENT_SLUG env var is required.")
+
+    deployment_slug: str = (args.deployment or "").strip() or DEPLOYMENT_SLUG
+    if not deployment_slug:
+        logger.error("A deployment slug is required (--deployment or DEPLOYMENT_SLUG env var).")
         return 2
 
-    if not JIRA_PROJECT_ID:
-        logger.error("JIRA_PROJECT_ID env var is required.")
+    if not PROJECT_PREFIX:
+        logger.error("PROJECT_PREFIX env var is required.")
         return 2
 
     jira_project_id: str = JIRA_PROJECT_ID
@@ -297,11 +445,11 @@ def main() -> int:
     client = SemgrepClient(SEMGREP_BASE_URL, token, timeout_s=REQUEST_TIMEOUT_S)
 
     logger.info("Semgrep base URL: %s", SEMGREP_BASE_URL)
-    logger.info("Deployment slug:  %s", DEPLOYMENT_SLUG)
+    logger.info("Deployment slug:  %s", deployment_slug)
     logger.info("Project prefix:   %s", PROJECT_PREFIX)
     logger.info("Severities:       %s", target_severities)
     logger.info("Issue type:       %s", issue_type)
-    logger.info("JIRA project ID:  %s", jira_project_id)
+    logger.info("JIRA project ID:  %s", jira_project_id if jira_project_id else "(not set)")
     logger.info("DRY_RUN:          %s", dry_run)
 
     # 1) Determine the list of repos to process
@@ -309,7 +457,7 @@ def main() -> int:
         matching = [args.repo.strip()]
         logger.info("Single-repo mode: %s", matching[0])
     else:
-        projects = client.list_projects(DEPLOYMENT_SLUG)
+        projects = client.list_projects(deployment_slug)
         project_names: List[str] = []
         for p in projects:
             name = get_project_name(p)
@@ -331,7 +479,7 @@ def main() -> int:
         logger.info("[REPO] %s", repo)
 
         findings = client.list_findings_for_repo(
-            DEPLOYMENT_SLUG,
+            deployment_slug,
             repo,
             severities=target_severities,
             issue_type=issue_type,
@@ -343,7 +491,9 @@ def main() -> int:
             logger.info("  - No findings.")
             continue
 
-        created_count = 0
+        success_count = 0
+        skipped_count = 0
+        failure_count = 0
         for f in findings:
             fields = extract_finding_fields(f)
             issue_id = fields.get("issue_id")
@@ -362,13 +512,47 @@ def main() -> int:
             if dry_run:
                 logger.info("  - DRY_RUN would create ticket: issue_id=%d issue_type=%s", issue_id, issue_type)
             else:
-                resp = client.create_ticket(DEPLOYMENT_SLUG, payload)
-                created_count += 1
-                logger.info("  - Created ticket: issue_id=%d issue_type=%s response_keys=%s", issue_id, issue_type, list(resp.keys()))
+                resp = client.create_ticket(deployment_slug, payload)
+                status = get_ticket_creation_status(resp, issue_id)
+                if status == "success":
+                    success_count += 1
+                elif status == "skipped":
+                    skipped_count += 1
+                elif status == "failure":
+                    failure_count += 1
+                if status == "failure":
+                    reason = get_ticket_creation_failure_reason(resp, issue_id)
+                    if reason:
+                        logger.info(
+                            "  - Ticket create status=%s issue_id=%d issue_type=%s reason=%s",
+                            status,
+                            issue_id,
+                            issue_type,
+                            reason,
+                        )
+                    else:
+                        logger.info(
+                            "  - Ticket create status=%s issue_id=%d issue_type=%s reason=unknown (inspect API response)",
+                            status,
+                            issue_id,
+                            issue_type,
+                        )
+                else:
+                    logger.info(
+                        "  - Ticket create status=%s issue_id=%d issue_type=%s",
+                        status,
+                        issue_id,
+                        issue_type,
+                    )
 
             ticketed_issue_ids.add(issue_id)
 
-        logger.info("  - Done. Tickets created: %d", created_count)
+        logger.info(
+            "  - Done. success=%d skipped=%d failure=%d",
+            success_count,
+            skipped_count,
+            failure_count,
+        )
 
     logger.info("All done.")
     return 0

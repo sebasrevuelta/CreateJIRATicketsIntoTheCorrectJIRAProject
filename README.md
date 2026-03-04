@@ -33,6 +33,7 @@ pip install requests
 | `SEMGREP_TOKEN` | Yes | Semgrep API token |
 | `DEPLOYMENT_SLUG` | Yes | Your Semgrep deployment slug |
 | `JIRA_PROJECT_ID` | Yes | JIRA project ID where tickets will be created (string or integer) |
+| `PROJECT_PREFIX` | Yes | Repository name prefix filter, e.g. `myorg/` |
 | `SEMGREP_BASE_URL` | No | Defaults to `https://semgrep.dev` |
 
 Example:
@@ -41,15 +42,10 @@ Example:
 export SEMGREP_TOKEN="xxxxx"
 export DEPLOYMENT_SLUG="my-deployment"
 export JIRA_PROJECT_ID="12345"
+export PROJECT_PREFIX="myorg/"
 ```
 
 ---
-
-## Configuration (Top of Script)
-
-| Constant | Description |
-|----------|-------------|
-| `PROJECT_PREFIX` | Repository prefix filter, e.g. `sebasrevuelta/` |
 
 ---
 
@@ -66,12 +62,16 @@ python semgrep_to_jira.py --no-dry-run --issue-type sast --severities critical
 
 # Create tickets for SCA high and critical findings on a single repo
 python semgrep_to_jira.py --no-dry-run --issue-type sca --severities high critical --repo sebasrevuelta/MyRepo
+
+# Override deployment slug from the command line
+python semgrep_to_jira.py --no-dry-run --deployment my-other-deployment --issue-type sast
 ```
 
 ### Arguments
 
 | Argument | Required | Default | Description |
 |----------|----------|---------|-------------|
+| `--deployment` | No | `DEPLOYMENT_SLUG` env var | Semgrep deployment slug. Overrides the env var when provided |
 | `--issue-type` | No | `sast` | Issue type to filter and ticket: `sast` or `sca` |
 | `--severities` | No | `critical` | Severity levels to fetch. Multiple values accepted |
 | `--dry-run` | No | `True` | Log actions without creating tickets (default behaviour) |
