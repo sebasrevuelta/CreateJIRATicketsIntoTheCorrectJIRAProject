@@ -46,6 +46,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _get_env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning("%s=%d is below minimum %d; using default %d", name, value, minimum, default)
+        return default
+    return value
+
+
 # =========================
 # Constants (edit these)
 # =========================
@@ -62,10 +77,10 @@ FINDINGS_PAGE_SIZE = 200
 FINDINGS_STATUS = "open"  # commonly "open" / "fixed" / etc. (adjust to your workflow)
 
 # Misc
-REQUEST_TIMEOUT_S = 30
-RATE_LIMIT_SLEEP_S = 2   # naive backoff on 429/5xx
-MAX_RETRIES = 5
-MAX_BACKOFF_S = 30
+REQUEST_TIMEOUT_S = _get_env_int("SEMGREP_REQUEST_TIMEOUT_S", 30)
+RATE_LIMIT_SLEEP_S = _get_env_int("SEMGREP_RETRY_SLEEP_S", 2)   # base backoff on 429/5xx/network errors
+MAX_RETRIES = _get_env_int("SEMGREP_MAX_RETRIES", 5)
+MAX_BACKOFF_S = _get_env_int("SEMGREP_MAX_BACKOFF_S", 30)
 
 
 # =========================
@@ -451,6 +466,10 @@ def main() -> int:
     logger.info("Issue type:       %s", issue_type)
     logger.info("JIRA project ID:  %s", jira_project_id if jira_project_id else "(not set)")
     logger.info("DRY_RUN:          %s", dry_run)
+    logger.info("Timeout (s):      %d", REQUEST_TIMEOUT_S)
+    logger.info("Max retries:      %d", MAX_RETRIES)
+    logger.info("Retry sleep (s):  %d", RATE_LIMIT_SLEEP_S)
+    logger.info("Max backoff (s):  %d", MAX_BACKOFF_S)
 
     # 1) Determine the list of repos to process
     if args.repo:

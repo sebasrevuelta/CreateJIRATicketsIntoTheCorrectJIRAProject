@@ -32,9 +32,13 @@ pip install requests
 |----------|----------|-------------|
 | `SEMGREP_TOKEN` | Yes | Semgrep API token |
 | `DEPLOYMENT_SLUG` | Yes | Your Semgrep deployment slug |
-| `JIRA_PROJECT_ID` | Yes | JIRA project ID where tickets will be created (string or integer) |
+| `JIRA_PROJECT_ID` | No | JIRA project ID where tickets will be created (string or integer). If omitted, payload is sent without this field |
 | `PROJECT_PREFIX` | Yes | Repository name prefix filter, e.g. `myorg/` |
 | `SEMGREP_BASE_URL` | No | Defaults to `https://semgrep.dev` |
+| `SEMGREP_REQUEST_TIMEOUT_S` | No | Request timeout in seconds (default: `30`) |
+| `SEMGREP_MAX_RETRIES` | No | Max retries for timeout/network and retryable HTTP errors (default: `5`) |
+| `SEMGREP_RETRY_SLEEP_S` | No | Base retry sleep in seconds used for incremental backoff (default: `2`) |
+| `SEMGREP_MAX_BACKOFF_S` | No | Max backoff cap in seconds (default: `30`) |
 
 Example:
 
@@ -43,6 +47,8 @@ export SEMGREP_TOKEN="xxxxx"
 export DEPLOYMENT_SLUG="my-deployment"
 export JIRA_PROJECT_ID="12345"
 export PROJECT_PREFIX="myorg/"
+export SEMGREP_REQUEST_TIMEOUT_S="60"
+export SEMGREP_MAX_RETRIES="8"
 ```
 
 ---
