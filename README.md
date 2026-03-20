@@ -146,8 +146,8 @@ POST /api/v1/deployments/{deploymentSlug}/tickets
 
 This automation bridges Semgrep security findings with JIRA workflows by:
 
-- Filtering repositories by prefix
-- Fetching findings filtered by severity and issue type
-- Creating one structured ticket per finding automatically
+- Filtering repositories by prefix.
+- Fetching findings filtered by severity and issue type.
+- Creating one structured ticket per finding automatically.
 
 It reduces manual triage effort while maintaining control and accuracy.
