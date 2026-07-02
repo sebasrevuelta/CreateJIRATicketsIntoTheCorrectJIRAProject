@@ -162,6 +162,26 @@ class SemgrepClient:
 
         raise RuntimeError(f"{method} {url} failed after retries.")
 
+    def list_deployments(self) -> List[Dict[str, Any]]:
+        data = self._request("GET", "/api/v1/deployments")
+        batch = (
+            data.get("deployments")
+            or data.get("data")
+            or data.get("results")
+            or []
+        )
+        if isinstance(batch, list):
+            return batch
+        raise RuntimeError(f"Unexpected deployments response shape: {data.keys()}")
+
+    def get_default_deployment_slug(self) -> Optional[str]:
+        """Return the slug of the first deployment accessible to the token."""
+        for d in self.list_deployments():
+            slug = d.get("slug") or d.get("name")
+            if isinstance(slug, str) and slug.strip():
+                return slug.strip()
+        return None
+
     def list_projects(self, deployment_slug: str) -> List[Dict[str, Any]]:
         path = f"/api/v1/deployments/{deployment_slug}/projects"
 
@@ -242,6 +262,27 @@ class SemgrepClient:
 
     def create_ticket(self, deployment_slug: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         path = f"/api/v1/deployments/{deployment_slug}/tickets"
+        return self._request("POST", path, json=payload)
+
+    def triage_findings(
+        self,
+        deployment_slug: str,
+        issue_ids: List[int],
+        *,
+        issue_type: str,
+        new_triage_state: str,
+    ) -> Dict[str, Any]:
+        """Bulk-triage findings to a new triage state via POST /triage.
+
+        e.g. new_triage_state="fixing" sets the finding's status to "To Fix".
+        Valid states: ignored, reviewing, fixing, reopened, provisionally_ignored.
+        """
+        path = f"/api/v1/deployments/{deployment_slug}/triage"
+        payload = {
+            "issue_ids": issue_ids,
+            "issue_type": issue_type,
+            "new_triage_state": new_triage_state,
+        }
         return self._request("POST", path, json=payload)
 
 
