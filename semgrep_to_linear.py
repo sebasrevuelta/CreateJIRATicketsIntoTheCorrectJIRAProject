@@ -195,7 +195,7 @@ class LinearClient:
         }
 
     def find_existing_issue(self, project_id: str, marker: str) -> bool:
-        """True if an issue whose description contains `marker` already exists in the project."""
+        """True if an issue whose title contains `marker` already exists in the project."""
         query = """
         query FindIssue($filter: IssueFilter!) {
           issues(filter: $filter, first: 1) {
@@ -206,7 +206,7 @@ class LinearClient:
         variables = {
             "filter": {
                 "project": {"id": {"eq": project_id}},
-                "description": {"contains": marker},
+                "title": {"contains": marker},
             }
         }
         data = self._graphql(query, variables)
@@ -380,9 +380,9 @@ def build_issue_content(
     path = fields.get("path")
     line = fields.get("line")
 
-    # Stable marker used for idempotent de-dupe across runs. It no longer appears
-    # in the title (which now leads with severity) — it is embedded in the issue
-    # description instead, and find_existing_issue() matches on it there.
+    # Stable marker embedded in the title so re-runs can de-dupe idempotently.
+    # find_existing_issue() matches on the title, so the marker must stay in it
+    # (Linear's description `contains` filter proved unreliable for this).
     marker = f"[Semgrep #{issue_id}]"
 
     # Title leads with the severity, e.g. "[High]".
@@ -397,7 +397,9 @@ def build_issue_content(
     if path:
         location_str = f" — {path}" + (f":{line}" if isinstance(line, int) else "")
 
-    title = f"[{severity_label}] {display_name}{location_str}"
+    # Marker leads the title so it survives truncation and find_existing_issue()
+    # can match on it; severity follows.
+    title = f"{marker} [{severity_label}] {display_name}{location_str}"
     # Linear title limit is generous, but keep it reasonable.
     if len(title) > 250:
         title = title[:247] + "..."
